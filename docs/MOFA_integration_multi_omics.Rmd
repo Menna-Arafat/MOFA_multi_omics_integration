@@ -1,0 +1,244 @@
+---
+title: "INTEGRATION OF MULTI-OMICS DATA (MOFA Pipeline)"
+author: "Menna Arafat"
+date:  "2024-9-25"
+Description: "The pipeline applies preprocessing, filteration, normalization of multiple omics layers then integration with MOFA package using the default parameters"
+output: html_document
+Main tutorial: https://raw.githack.com/bioFAM/MOFA2_tutorials/master/R_tutorials/CLL.html
+---
+  
+
+```{r}
+ suppressPackageStartupMessages({ 
+library("MOFA2")
+library(tibble)
+library(plyr)
+library(dplyr)
+library(tidyverse)
+library(tibble)
+library(gridExtra)
+})
+```
+## create output directory
+```{r}
+dir.create("output")
+```
+
+## load data
+
+```{r}
+
+data_dir <- "C:/Users/USER/Documents/GitHub/github_projects/MOFA_integration_multi_omics/data/"
+list.files(data_dir)
+
+for(file in list.files(data_dir, pattern= ".csv")){
+  x= read.csv(file.path(data_dir, file)) %>% column_to_rownames("X")
+  name= strsplit(file, "_")[[1]][1]
+  assign(name, x, envir= .GlobalEnv)
+}
+```
+## create list of datasets
+
+```{r}
+TNBC_data=list(mRNA= mrna, miRNA= mirna, lnRNA= lnrna, Proteome= protein, Methylation= methyl) 
+```
+
+
+##for methylome if it is beta value, convert beta value to M value
+
+```{r}
+# methyl= methyl[!apply(is.na(methyl), 1, all), ] 
+# beta_values= methyl %>% dplyr::select(where(is.numeric))
+# M_values <- log2(beta_values / (1 - beta_values))
+# M_values$gene_symbol= methyl$gene_symbol
+# methylome= M_values
+```
+
+## data filteration
+## drop NA and duplicate gene symbols 
+
+```{r}
+TNBC_data= lapply(TNBC_data, function(x) {
+         x = x %>% rownames_to_column("gene_symbol") %>% 
+                    filter(!is.na(gene_symbol)& gene_symbol != "") %>%
+                    as.data.frame() 
+         #' ## drop duplicate gene symbols, keeping the greater of them
+         x= x %>%   mutate(rs = rowSums(dplyr::select(., where(is.numeric)), na.rm = TRUE)/ncol(x)) %>%
+                    group_by(gene_symbol) %>%
+                    dplyr::slice(which.max(abs(rs))) %>%
+                    dplyr::select(-rs) %>%
+                    ungroup() %>% 
+                    column_to_rownames("gene_symbol")
+
+})
+```
+
+
+## drop rows that contain all NA
+```{r}
+TNBC_data= lapply(TNBC_data, function(x)  x[!apply(is.na(x), 1, all), ] )
+```
+
+
+## function to Assign tumor or normal to samples based on sample barcodes, for example, 1:50 Tumor, 51:89 Normal
+
+```{r}
+modify_sample_name <- function(name) {
+    #' ##  Clean the fourth part to keep only digits
+   num <- as.numeric(gsub("\\D", "", name))
+    
+    #' ##  Check conditions and modify names accordingly
+    if (!is.na(num) &&  num <= 50) {
+      return(paste0(name, "_Tumor"))
+    } else if (!is.na(num) && num > 50 ) {
+      return(paste0(name, "_Normal"))
+    } else {
+      return(name)  
+    }
+  }
+```
+
+##  Apply the function
+
+```{r}
+for(x in seq_along(TNBC_data)) { 
+  
+  names_mod= sapply(names(TNBC_data[[x]]), modify_sample_name)
+  TNBC_data[[x]]= setNames(TNBC_data[[x]], names_mod)
+  
+  }
+```
+
+## recheck colnames
+
+```{r}
+lapply(TNBC_data, function(x) head(names(x)))
+```
+
+## subset datasets based on shared sample ids
+
+```{r}
+shared_samples= Reduce(intersect, lapply(TNBC_data, function(x) names(x)))
+shared_samples
+
+TNBC_shared <- lapply(TNBC_data, function(x) x[, match(shared_samples, colnames(x))])
+```
+
+## For high dimensional data, select most 5000 genes to apply MOFA on
+##  Function to select the top 5000 most variable genes
+
+```{r}
+select_most_variable <- function(data, top_n = NULL) {
+  #' ##  Calculate variance for each gene (row) across samples (columns)
+  gene_variances <- apply(data, 1, var, na.rm = TRUE)
+  top_genes_idx <- order(gene_variances, decreasing = TRUE)[1:top_n]
+  top_variable <- data[top_genes_idx, ]
+
+  return(top_variable)
+}
+```
+
+## Apply the function to each dataframe in TNBC_shared
+
+```{r}
+TNBC_shared_most_variable <- lapply(TNBC_shared, function(x){
+  if(nrow(x) >10000){
+  x= select_most_variable(x, top_n = 10000)
+  }else{
+    return(x)
+  }
+  })
+```
+
+
+## groups metadata
+
+```{r}
+
+group= as.factor(ifelse(grepl("Tumor", shared_samples), "TNBC", "Normal")) 
+
+meta= data.frame(
+  sample= shared_samples,
+  level = ifelse(grepl("Tumor", shared_samples), "Tumor", "Normal"),
+  condition = ifelse(grepl("Tumor", shared_samples), 1, 0)
+)
+```
+
+# MOFA pipeline
+
+## MOFA takes data in form of list of matrices, each of which represent a separate omic layer(each should have the same number of samples with the same name/barcode)
+
+```{r}
+TNBC_mofa= lapply(TNBC_shared , function(x) as.matrix(x) )
+lapply(TNBC_mofa, dim)
+```
+
+## Create the MOFA object, set groups before training
+## - The aim of the multi-group framework is to identify the sources of variability *within* the groups.
+## If your aim is to find a factor that 'separates' the groups, you DO NOT want to use the multi-group framework
+
+```{r}
+MOFAobject <- create_mofa(TNBC_mofa, groups = NULL, extract_metadata = TRUE)
+MOFAobject
+```
+
+
+## visualize data structure
+
+```{r}
+p1= plot_data_overview(MOFAobject, covariate =TNBC)
+p2= plot_data_overview(MOFAobject, covariate =Normal)
+grid.arrange(p1, p2, ncol = 2)
+
+png("output/data_structure_mofa.png", width = 5000, height = 2080, res = 600)
+plot_data_overview(MOFAobject)
+dev.off()
+```
+
+##  Add sample metadata to the model
+
+```{r}
+samples_metadata(MOFAobject) <- meta
+```
+
+## check data options
+
+```{r}
+data_opts <- get_default_data_options(MOFAobject)
+data_opts$center_groups= FALSE #' ## set TRUE if the data is not mean centered
+```
+
+## check model options
+
+```{r}
+model_opts <- get_default_model_options(MOFAobject)
+model_opts$ard_factors= FALSE   #' ## ard_factors: use ARD prior in the factors? Default is TRUE if using multiple groups.
+                               #' ## ard_weights: use ARD prior in the weights? Default is TRUE if using multiple views.
+```
+
+## training options
+
+```{r}
+train_opts <- get_default_training_options(MOFAobject)
+train_opts$convergence_mode <- "medium"
+train_opts$drop_factor_threshold= -1 #' ##  a value of 0.01 implies that factors explaining less than 1% of variance (in each view) will be dropped
+```
+
+## prepare object mofa
+
+```{r}
+MOFAobject <- prepare_mofa(MOFAobject,
+                           data_options = data_opts,
+                           model_options = model_opts,
+                           training_options = train_opts
+)
+```
+
+## train mofa
+
+```{r, message=FALSE, results='hide'}
+MOFAobject <- run_mofa(MOFAobject, outfile= "output/MOFA2.hdfs", use_basilisk = TRUE)
+
+saveRDS(MOFAobject,"output/MOFA2.rds")
+```
+## ------------------------------------------------------------------------------------------------------

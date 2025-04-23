@@ -1,0 +1,341 @@
+---
+title: "MOFA INTEGRATION OF MULTI-OMICS DATA"
+author: "Menna Arafat"
+date:  "2024-9-25"
+output: html_document
+Main tutorial: https://raw.githack.com/bioFAM/MOFA2_tutorials/master/R_tutorials/CLL.html
+---
+  
+
+```{r}
+ suppressPackageStartupMessages({ 
+library("MOFA2")
+library(tibble)
+library(plyr)
+library(dplyr)
+library(tidyverse)
+library(DESeq2)
+library(fgsea)
+library(org.Hs.eg.db)
+library("pheatmap")
+library("dichromat")
+library("RColorBrewer")
+library(ComplexHeatmap)
+library(circlize)
+library(stats)
+library(openxlsx)
+library(igraph)
+library(Rgraphviz)
+library(gridExtra)
+ })
+```
+
+## Load precomputed model
+
+```{r}
+MOFAobject <- readRDS("output/MOFA2_TNBC.last.rds")
+TNBC_mofa= MOFAobject@data
+meta= MOFAobject@samples_metadata
+```
+
+## Dimensionality of the Weight matrix: 5000 features, 15 factors
+
+```{r}
+lapply(MOFAobject@expectations$W, dim)
+
+```
+##  Add sample metadata to the model
+
+```{r}
+shared_samples= MOFAobject@samples_metadata$sample
+meta= data.frame(
+  sample= shared_samples,
+  level = ifelse(grepl("Tumor", shared_samples), "Tumor", "Normal"),
+  condition = ifelse(grepl("Tumor", shared_samples), 1, 0)
+)
+
+samples_metadata(MOFAobject) <- meta
+```
+
+##visualizations
+
+```{r}
+png("output/plot_factor_cor.png",width = 2180, height = 2080, res= 600 )
+plot_factor_cor(MOFAobject)
+dev.off()
+```
+
+##--------------------
+##plot variance explained by each factor
+
+```{r}
+library(gridExtra)
+plot1 <- plot_variance_explained(MOFAobject, x = "view", max_r2 = 40)
+plot2 <- plot_variance_explained(MOFAobject, plot_total = TRUE)[[2]]+ coord_flip()
+
+png("output/plot_variance_explained_last.png", width = 7000, height = 2080, res = 600)
+grid.arrange(plot1, plot2, ncol = 2)
+dev.off()
+```
+
+```{r}
+png("output/plot_summary_factors_scores_last.png",width = 2880, height = 1880, res= 600 )
+summarise_factors(
+  MOFAobject, 
+  meta,
+  factors = "all",
+  groups = "all",
+  abs = FALSE,
+  return_data = FALSE
+)+ theme(axis.text.x = element_text(angle = 65, hjust = 1))
+
+dev.off()
+```
+
+
+##heatmap represent each factor correlation with condition (pearson corelation, p-value)
+
+```{r}
+factors <- get_factors(MOFAobject, factors = 1:15)$group1 %>% as.data.frame()
+condition=  model.matrix(~ 0+meta$level) %>% as.data.frame()
+names(condition)= gsub("meta\\$level", "", names(condition))
+row.names(condition)= meta$sample
+
+apply_cor= function(covariates, factors){
+  corr=  cor.test(covariates, factors, method = c("pearson"))
+  cor_coeff =corr$estimate %>% round(., 2)
+  p_values= corr$p.value %>% round(., 2) %>% sprintf("%.2f", .)
+  x <- data.frame(
+    cor_coeff = cor_coeff,
+    p_value = p_values,
+    stringsAsFactors = FALSE)
+  return(x)
+}
+
+corr_T <- mapply(function(factor_col) apply_cor(condition$Tumor, factor_col),
+                 as.data.frame(factors),
+                 SIMPLIFY = TRUE) %>% t() %>% as.data.frame()
+
+corr_N <- mapply(function(factor_col) apply_cor(condition$Normal, factor_col),
+                 as.data.frame(factors), 
+                 SIMPLIFY = TRUE) %>% t() %>% as.data.frame()
+```
+
+##heatmap
+
+```{r}
+library(forcats)
+factor= rep(paste0("Factor", 1:ncol(factors)), times = 2)
+
+heatmap_data <- data.frame(
+  factor = forcats::fct_inorder(factor),
+  condition = c(rep("TNBC", ncol(factors)), rep("Normal", ncol(factors))),
+  cor_coeff = c(unlist(corr_T$cor_coeff), unlist(corr_N$cor_coeff)),
+  p_value = c(unlist(corr_T$p_value), unlist(corr_N$p_value)),
+  stringsAsFactors = FALSE
+)
+```
+
+## Create combined labels for the heatmap
+
+```{r}
+heatmap_data$label <- with(heatmap_data, 
+                           paste0( sprintf("%.2f", cor_coeff), "\n",
+                                   paste("(", p_value, ")") ))
+
+
+
+plot= ggplot(heatmap_data, aes(x = factor, y = condition, fill = cor_coeff)) +
+  geom_tile(color = "white") +  #' ## Draw the heatmap squares
+  geom_text(aes(label = label), color = "black", size = 3) + 
+  scale_fill_gradient2(low =  "white", high ="#BA55D3", midpoint = 0, 
+                       limit = c(-1, 1), name = "Correlation Coeff.") +  
+  labs(x = "MOFA Factors", y = "", title = "") +
+  theme_bw() + 
+  theme(
+    axis.text.x = element_text(angle = 65, hjust = 1, size = 12), 
+    axis.text.y = element_text( size = 15), 
+    panel.background = element_rect(fill = "white"),  
+    plot.background = element_rect(fill = "white"),   
+    panel.grid = element_blank(),
+    axis.line = element_blank(),
+    axis.ticks = element_blank(),
+    panel.border = element_blank()
+    
+  ) 
+
+ggsave("output/factor_condition_corr_last.png",plot, dpi = 600, width = 16, height = 9)
+```
+
+
+## plot factor 1, 2 to see the clustering of samples in this space
+
+```{r}
+png("output/PCA_like_plots_Factors_last.png",width = 2880, height = 1880, res= 600 )
+plot_factors(MOFAobject, 
+             factors = c(1,2), 
+             color_by = "level",
+             #' ##shape_by = "trisomy12",
+             dot_size = 2.5,
+             show_missing = T,
+             color_name= "Groups"
+)
+dev.off()
+```
+##plot important features for each factor
+
+```{r}
+x1= plot_top_weights(MOFAobject, factors = 1, nfeatures = 10, view = 1)
+x2= plot_top_weights(MOFAobject, factors = 2, nfeatures = 10, view =  1)
+x3= plot_top_weights(MOFAobject, factors = 1, nfeatures = 10, view = 2)
+x4= plot_top_weights(MOFAobject, factors = 2, nfeatures = 10, view =  2)
+x5= plot_top_weights(MOFAobject, factors = 1, nfeatures = 10, view = 3)
+x6= plot_top_weights(MOFAobject, factors = 2, nfeatures = 10, view =  3)
+x7= plot_top_weights(MOFAobject, factors = 1, nfeatures = 10, view = 4)
+x8= plot_top_weights(MOFAobject, factors = 2, nfeatures = 10, view =  4)
+x9= plot_top_weights(MOFAobject, factors = 1, nfeatures = 10, view = 5)
+x10= plot_top_weights(MOFAobject, factors = 2, nfeatures = 10, view =  5)
+
+#x <- paste0("x", 1:10)
+#cat(x, sep = ", ")
+png("output/important_features_F1_F2_across_views_last.png", width = 6000, height = 9080, res = 600)
+grid.arrange(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10 , ncol = 2, nrow= 5)
+dev.off()
+```
+##-----------------------------------------------------------------------------
+
+##Heatmap for top high weigt features for each layer
+##get weight matrix from MOFAobj
+
+```{r}
+MOFAobject@data_options$views
+
+weights_F1 <- get_weights(MOFAobject, view = "Proteome", factor = 1) %>% as.data.frame()
+head(weights_F1)
+
+```
+
+##get top weight features
+
+```{r}
+features1 = weights_F1 %>%
+  arrange(desc(abs(Factor1))) %>% 
+  dplyr::slice(1:50) %>% row.names()
+
+
+features= c(features1 )  
+```
+
+##subset expression matrix to include only these top features
+
+```{r}
+data <- as.data.frame(TNBC_mofa[["Proteome"]])
+heat_data= data[row.names(data) %in% features, ] 
+
+row.names(heat_data)= gsub("_Methylation|_mRNA|_Proteome", "", row.names(heat_data))
+head(heat_data)
+```
+
+##set annotations for heatmap from meta data
+
+```{r}
+meta$Condition= as.factor(meta$level)
+
+ta <- HeatmapAnnotation(
+  Condition = meta[, c("Condition")],
+  col = list(
+    Condition = c("Tumor" =   "#E3B31C", "Normal" = "#B0C4DE")
+   
+  ),
+  annotation_height = unit(7, "mm")
+)
+
+heatmap  <- Heatmap(
+  matrix = as.matrix(heat_data),
+  name = "Normalized Express.data",
+  col = colorRamp2(c(-3, 0, 3), c("#9370DB", "#F7F5F4","red" )),#' ##matlab::jet.colors(200),
+  show_row_names = TRUE,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_column_names = FALSE,
+  top_annotation  = ta
+  #' ##column_title = ""
+) 
+print(heatmap)
+```
+
+## Save to pdf
+
+```{r}
+png("output/heatmap_proteome_F1_50.png",width = 6000, height = 7000, res = 600)
+draw(heatmap, annotation_legend_side =  "right")
+dev.off()
+```
+
+
+##for heatmap visualization use denoised data reconconstruceted by MOFA mpde;
+
+```{r}
+factors <- get_factors(MOFAobject)$group1
+weights <- get_weights(MOFAobject, view = 1)$mRNA  
+
+reconstructed_view1 <- factors %*% t(weights)
+```
+
+
+##additional plots
+##heatmap expression data
+
+```{r}
+plot_data_heatmap(MOFAobject, 
+                  view = "mRNA",
+                  factor = 2,  
+                  features = 25,
+                  cluster_rows = FALSE, cluster_cols = FALSE,
+                  show_rownames = TRUE, show_colnames = FALSE,
+                  #' ##annotation_samples = ,
+                  scale = "row"
+)
+```
+
+##plot heatmap with modeled data (after model estimation)
+
+```{r}
+plot_data_heatmap(MOFAobject, 
+                  view = "mRNA",
+                  factor = 3,  
+                  features = 25,
+                  denoise = TRUE, #' ##set FALSE to use original data input
+                  cluster_rows = TRUE, cluster_cols = FALSE,
+                  show_rownames = TRUE, show_colnames = FALSE,
+                  scale = "row"
+)
+```
+
+##plot high weight features
+
+```{r}
+plot_weights(MOFAobject, factors = 1, nfeatures = 20, view = 1, return_data = TRUE)
+
+TNBC_mofa %>% names()
+plot_top_weights(MOFAobject, factors = 1, nfeatures = 50, view = 5)
+
+plot_factor(MOFAobject, 
+            factors = 2, 
+            color_by = "condition"
+)
+```
+
+##plot data scatter
+
+```{r}
+plot_data_scatter(MOFAobject, 
+                  view = "mRNA",
+                  factor = 4,  
+                  features = 4,
+                  sign = "positive",
+                  color_by = "condition"
+) + labs(y="RNA expression")
+```
+
+
